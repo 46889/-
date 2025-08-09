@@ -2,6 +2,8 @@ import requests
 import textwrap
 import re
 import logging
+import json
+import base64
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -24,16 +26,25 @@ logger = logging.getLogger(__name__)
 # Конфигурация
 API_KEY = "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"
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "mistralai/mistral-7b-instruct"  # Надежная бесплатная модель
+MODEL = "mistralai/mistral-7b-instruct"
 TOKEN = "7951956501:AAH0D0oMdiMXUnhCtvWavrrOCU2zqWUA69I"
-ADMIN_ID = 123456789  # Замените на свой ID
+ADMIN_ID = 1478525032  # Замените на свой ID
 
 # Состояния разговора
 MAIN_MENU, AWAITING_TOPIC, PLAN_CREATED, POST_STUDY_CHOICE, TEST_IN_PROGRESS, POST_TEST_CHOICE, HISTORY_VIEW = range(7)
 
 class Database:
-    def __init__(self):
-        self.data = {"users": {}, "stats": {"total_users": 0, "total_searches": 0}}
+    def __init__(self, state_data=None):
+        if state_data:
+            self.data = json.loads(base64.b64decode(state_data).decode('utf-8'))
+            logger.info("Database restored from backup")
+        else:
+            self.data = {"users": {}, "stats": {"total_users": 0, "total_searches": 0}}
+            logger.info("New database created")
+    
+    def export_state(self):
+        """Экспортирует состояние базы данных в base64 строку"""
+        return base64.b64encode(json.dumps(self.data).encode('utf-8')).decode('utf-8')
     
     def add_user(self, user_id, username=None):
         user_id = str(user_id)
@@ -47,27 +58,32 @@ class Database:
                 "tests_taken": 0
             }
             self.data["stats"]["total_users"] += 1
+            logger.info(f"New user added: {user_id}")
     
     def add_search(self, user_id, topic):
         user_id = str(user_id)
-        self.data["users"][user_id]["searches"].append({
-            "topic": topic,
-            "date": datetime.now().isoformat()
-        })
-        self.data["stats"]["total_searches"] += 1
+        if user_id in self.data["users"]:
+            self.data["users"][user_id]["searches"].append({
+                "topic": topic,
+                "date": datetime.now().isoformat()
+            })
+            self.data["stats"]["total_searches"] += 1
+            logger.info(f"Search added for {user_id}: {topic}")
     
     def add_to_history(self, user_id, topic, plan, score=None):
         user_id = str(user_id)
-        history_item = {
-            "topic": topic,
-            "plan": plan,
-            "date": datetime.now().isoformat(),
-            "score": score
-        }
-        self.data["users"][user_id]["history"].append(history_item)
-        if score is not None:
-            self.data["users"][user_id]["total_score"] += score
-            self.data["users"][user_id]["tests_taken"] += 1
+        if user_id in self.data["users"]:
+            history_item = {
+                "topic": topic,
+                "plan": plan,
+                "date": datetime.now().isoformat(),
+                "score": score
+            }
+            self.data["users"][user_id]["history"].append(history_item)
+            if score is not None:
+                self.data["users"][user_id]["total_score"] += score
+                self.data["users"][user_id]["tests_taken"] += 1
+            logger.info(f"History added for {user_id}: {topic} ({score}%)")
     
     def get_user_history(self, user_id):
         user_id = str(user_id)
@@ -78,6 +94,11 @@ class Database:
     
     def get_stats(self):
         return self.data["stats"]
+    
+    def clear_database(self):
+        """Очищает базу данных"""
+        self.data = {"users": {}, "stats": {"total_users": 0, "total_searches": 0}}
+        logger.info("Database cleared")
 
 # Инициализация базы данных
 db = Database()
@@ -102,24 +123,19 @@ def get_time():
 
 def clean_math_symbols(text):
     """Упрощает математические выражения для текстового отображения"""
-    # Заменяем дроби
     text = re.sub(r'\\frac\{([^{}]+)\}\{([^{}]+)\}', r'\1/\2', text)
-    # Удаляем другие LaTeX команды
     text = re.sub(r'\\[a-zA-Z]+\{?', '', text)
-    # Удаляем оставшиеся скобки
     text = re.sub(r'\{|\}', '', text)
     return text.strip()
 
 def format_response(text):
     """Форматирует ответ для отправки пользователю"""
     cleaned = clean_math_symbols(text)
-    cleaned = re.sub(r'\*\*|__', '', cleaned)  # Удаляем разметку жирного текста
+    cleaned = re.sub(r'\*\*|__', '', cleaned)
     wrapped = textwrap.fill(cleaned, width=100)
     return f"{get_time()} AI: {wrapped}"
 
 def generate_plan(topic):
-    """Генерирует учебный план по теме"""
-    # Заглушка на случай проблем с API
     fallback_plan = [
         {"title": f"Введение в {topic}"},
         {"title": "Основные понятия и определения"},
@@ -157,7 +173,6 @@ def generate_plan(topic):
         return fallback_plan
 
 def send_api_request(messages, max_tokens=200):
-    """Отправляет запрос к API с обработкой ошибок"""
     try:
         headers = {
             "Authorization": f"Bearer {API_KEY}",
@@ -187,7 +202,6 @@ def send_api_request(messages, max_tokens=200):
         return f"⚠️ Ошибка обработки: {str(e)}"
 
 def generate_test_questions(topic, count=3):
-    """Генерирует тестовые вопросы по теме"""
     try:
         messages = [{
             "role": "system",
@@ -210,7 +224,6 @@ def generate_test_questions(topic, count=3):
         return []
 
 def parse_test_questions(text):
-    """Парсит сгенерированные вопросы теста"""
     questions = []
     pattern = r'ВОПРОС\s*\d+:\s*(.+?)\s*A\)\s*(.+?)\s*B\)\s*(.+?)\s*C\)\s*(.+?)\s*D\)\s*(.+?)\s*ОТВЕТ:\s*([A-D])'
     matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
@@ -230,7 +243,6 @@ def parse_test_questions(text):
     return questions
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработчик команды /start"""
     user = update.effective_user
     db.add_user(user.id, user.username)
     
@@ -255,7 +267,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return MAIN_MENU
 
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка главного меню"""
     query = update.callback_query
     await query.answer()
     state = context.user_data['state']
@@ -270,10 +281,11 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     
     elif query.data == "about":
         about_text = (
-            "🤖 Учебный бот v2.0\n\n"
+            "🤖 Учебный бот v3.0\n\n"
             "📚 Создаю планы обучения\n"
             "🧪 Провожу тесты\n"
-            "📊 Сохраняю историю\n\n"
+            "📊 Сохраняю историю\n"
+            "💾 Данные сохраняются в памяти\n\n"
             "Выберите 'Новое обучение' для начала!"
         )
         
@@ -285,7 +297,6 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return await start_from_callback(query, context)
 
 async def start_from_callback(query, context):
-    """Возврат в главное меню"""
     keyboard = [
         [InlineKeyboardButton("📚 Новое обучение", callback_data="new_learning")],
         [InlineKeyboardButton("📖 Моя история", callback_data="my_history")],
@@ -296,7 +307,6 @@ async def start_from_callback(query, context):
     return MAIN_MENU
 
 async def show_history(query, context):
-    """Показывает историю обучения пользователя"""
     user_id = query.from_user.id
     history = db.get_user_history(user_id)
     
@@ -313,13 +323,14 @@ async def show_history(query, context):
     text = "📖 Ваша история обучения:\n\n"
     keyboard = []
     
-    for i, item in enumerate(history[-10:]):  # Последние 10 элементов
+    recent_history = history[-10:]
+    for i, item in enumerate(recent_history):
         date = datetime.fromisoformat(item["date"]).strftime("%d.%m")
         score_text = f" ({item['score']}%)" if item.get('score') else ""
         text += f"{i+1}. {item['topic']} - {date}{score_text}\n"
         keyboard.append([InlineKeyboardButton(
             f"{i+1}. {item['topic'][:25]}...", 
-            callback_data=f"history_{len(history)-10+i}"  # Фикс индексации
+            callback_data=f"history_{len(history)-10+i}"
         )])
     
     keyboard.append([InlineKeyboardButton("← Главное меню", callback_data="main_menu")])
@@ -327,7 +338,6 @@ async def show_history(query, context):
     return HISTORY_VIEW
 
 async def handle_history_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка выбора из истории"""
     query = update.callback_query
     await query.answer()
     
@@ -362,7 +372,6 @@ async def handle_history_selection(update: Update, context: ContextTypes.DEFAULT
     return HISTORY_VIEW
 
 async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка ввода темы"""
     state = context.user_data['state']
     user_input = update.message.text.strip()
     user_id = update.effective_user.id
@@ -397,7 +406,6 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return PLAN_CREATED
 
 async def handle_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка шагов учебного плана"""
     query = update.callback_query
     await query.answer()
     state = context.user_data['state']
@@ -457,7 +465,6 @@ async def handle_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     return PLAN_CREATED
 
 async def handle_end_plan(update, context: ContextTypes.DEFAULT_TYPE):
-    """Завершение учебного плана"""
     if isinstance(update, Update):
         user_id = update.message.from_user.id
     else:
@@ -479,7 +486,6 @@ async def handle_end_plan(update, context: ContextTypes.DEFAULT_TYPE):
     return POST_STUDY_CHOICE
 
 async def handle_test_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка выбора после обучения"""
     query = update.callback_query
     await query.answer()
     state = context.user_data['state']
@@ -505,7 +511,6 @@ async def handle_test_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return await handle_end_plan(query, context)
 
 async def show_question(context, state, user_id):
-    """Показывает текущий вопрос теста"""
     if state.current_question_index >= len(state.test_questions):
         return await finish_test(context, state, user_id)
     
@@ -526,7 +531,6 @@ async def show_question(context, state, user_id):
     )
 
 async def handle_test_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка ответа на вопрос теста"""
     query = update.callback_query
     await query.answer()
     state = context.user_data['state']
@@ -556,7 +560,6 @@ async def handle_test_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return await finish_test(context, state, query.from_user.id)
 
 async def finish_test(context, state, user_id):
-    """Завершение теста и показ результатов"""
     score_percent = int((state.test_score / len(state.test_questions)) * 100) if state.test_questions else 0
     
     result_text = f"📊 Результат: {state.test_score}/{len(state.test_questions)} ({score_percent}%)"
@@ -583,7 +586,6 @@ async def finish_test(context, state, user_id):
     return POST_TEST_CHOICE
 
 async def handle_post_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка действий после теста"""
     query = update.callback_query
     await query.answer()
     state = context.user_data['state']
@@ -654,13 +656,58 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(text)
 
+async def admin_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Создание резервной копии базы данных"""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Доступ запрещен")
+        return
+    
+    try:
+        state_data = db.export_state()
+        await update.message.reply_text(
+            f"💾 Резервная копия базы данных (base64):\n\n"
+            f"<code>{state_data}</code>\n\n"
+            "Используйте /restore для восстановления",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Ошибка создания резервной копии: {str(e)}")
+
+async def admin_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Восстановление базы данных из резервной копии"""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Доступ запрещен")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("ℹ️ Использование: /restore <base64_data>")
+        return
+    
+    try:
+        global db
+        state_data = ' '.join(context.args)
+        db = Database(state_data)
+        await update.message.reply_text("✅ База данных успешно восстановлена из резервной копии!")
+        logger.info(f"Database restored. Users: {db.get_stats()['total_users']}")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Ошибка восстановления: {str(e)}")
+        logger.error(f"Restore error: {str(e)}")
+
+async def admin_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Очистка базы данных"""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Доступ запрещен")
+        return
+    
+    db.clear_database()
+    await update.message.reply_text("✅ База данных полностью очищена!")
+    logger.info("Database cleared by admin")
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Отмена текущего действия"""
     await update.message.reply_text("❌ Действие отменено")
     return ConversationHandler.END
 
 def main() -> None:
-    """Запуск бота"""
     application = Application.builder().token(TOKEN).build()
     
     conv_handler = ConversationHandler(
@@ -683,11 +730,14 @@ def main() -> None:
     
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler('admin', admin_panel))
-    
-    # Обработка команды /start вне диалога
+    application.add_handler(CommandHandler('backup', admin_backup))
+    application.add_handler(CommandHandler('restore', admin_restore))
+    application.add_handler(CommandHandler('clear_db', admin_clear))
     application.add_handler(CommandHandler('start', start))
     
     logger.info("Бот запущен")
+    logger.info(f"Текущее состояние базы: Пользователей: {db.get_stats()['total_users']}, Поисков: {db.get_stats()['total_searches']}")
+    
     application.run_polling()
 
 if __name__ == "__main__":
