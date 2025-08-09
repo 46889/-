@@ -1,14 +1,30 @@
 import requests
 import textwrap
 import re
+import logging
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, ConversationHandler, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    ConversationHandler,
+    filters
+)
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 # Конфигурация
-API_KEY = "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"
+API_KEY = "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"
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "deepseek/deepseek-chat"
+MODEL = "mistralai/mistral-7b-instruct"  # Надежная бесплатная модель
 TOKEN = "7951956501:AAH0D0oMdiMXUnhCtvWavrrOCU2zqWUA69I"
 ADMIN_ID = 123456789  # Замените на свой ID
 
@@ -18,10 +34,6 @@ MAIN_MENU, AWAITING_TOPIC, PLAN_CREATED, POST_STUDY_CHOICE, TEST_IN_PROGRESS, PO
 class Database:
     def __init__(self):
         self.data = {"users": {}, "stats": {"total_users": 0, "total_searches": 0}}
-    
-    def save_data(self):
-        # Данные хранятся только в памяти
-        pass
     
     def add_user(self, user_id, username=None):
         user_id = str(user_id)
@@ -35,7 +47,6 @@ class Database:
                 "tests_taken": 0
             }
             self.data["stats"]["total_users"] += 1
-            self.save_data()
     
     def add_search(self, user_id, topic):
         user_id = str(user_id)
@@ -44,7 +55,6 @@ class Database:
             "date": datetime.now().isoformat()
         })
         self.data["stats"]["total_searches"] += 1
-        self.save_data()
     
     def add_to_history(self, user_id, topic, plan, score=None):
         user_id = str(user_id)
@@ -58,7 +68,6 @@ class Database:
         if score is not None:
             self.data["users"][user_id]["total_score"] += score
             self.data["users"][user_id]["tests_taken"] += 1
-        self.save_data()
     
     def get_user_history(self, user_id):
         user_id = str(user_id)
@@ -91,111 +100,145 @@ class StudyState:
 def get_time():
     return datetime.now().strftime("%H:%M")
 
+def clean_math_symbols(text):
+    """Упрощает математические выражения для текстового отображения"""
+    # Заменяем дроби
+    text = re.sub(r'\\frac\{([^{}]+)\}\{([^{}]+)\}', r'\1/\2', text)
+    # Удаляем другие LaTeX команды
+    text = re.sub(r'\\[a-zA-Z]+\{?', '', text)
+    # Удаляем оставшиеся скобки
+    text = re.sub(r'\{|\}', '', text)
+    return text.strip()
+
 def format_response(text):
-    cleaned = text.replace("**", "").replace("__", "").replace("\\", "")
+    """Форматирует ответ для отправки пользователю"""
+    cleaned = clean_math_symbols(text)
+    cleaned = re.sub(r'\*\*|__', '', cleaned)  # Удаляем разметку жирного текста
     wrapped = textwrap.fill(cleaned, width=100)
     return f"{get_time()} AI: {wrapped}"
 
 def generate_plan(topic):
-    messages = [{
-        "role": "system",
-        "content": "Ты учитель. Создай учебный план из 5 шагов по заданной теме. Каждый шаг должен быть кратко озаглавлен. Выведи только шаги в формате: 1. [Название шага 1]\n2. [Название шага 2]\n...\n5. [Название шага 5]"
-    }, {
-        "role": "user",
-        "content": f"Создай учебный план из 5 шагов по теме: '{topic}'"
-    }]
+    """Генерирует учебный план по теме"""
+    # Заглушка на случай проблем с API
+    fallback_plan = [
+        {"title": f"Введение в {topic}"},
+        {"title": "Основные понятия и определения"},
+        {"title": "Ключевые методы решения"},
+        {"title": "Практическое применение"},
+        {"title": "Закрепление материала"}
+    ]
     
-    response = send_api_request(messages, max_tokens=300)
-    steps = []
-    
-    for line in response.split('\n'):
-        if line.strip() == '':
-            continue
-        match = re.match(r'(\d+)\.\s*(.+)', line)
-        if match:
-            step_title = match.group(2).strip()
-            steps.append({"title": step_title})
-    
-    if len(steps) < 3:
-        return [
-            {"title": f"Введение в {topic}"},
-            {"title": "Основные понятия и определения"},
-            {"title": "Ключевые методы решения"},
-            {"title": "Практическое применение"},
-            {"title": "Закрепление материала"}
-        ]
-    return steps[:5]
+    try:
+        messages = [{
+            "role": "system",
+            "content": "Ты учитель. Создай учебный план из 5 шагов по заданной теме. "
+                       "Каждый шаг должен быть кратко озаглавлен. Выведи только шаги в формате: "
+                       "1. [Название шага 1]\n2. [Название шага 2]\n...\n5. [Название шага 5]"
+        }, {
+            "role": "user",
+            "content": f"Создай учебный план из 5 шагов по теме: '{topic}'"
+        }]
+        
+        response = send_api_request(messages, max_tokens=300)
+        if response.startswith("⚠️"):
+            return fallback_plan
+            
+        steps = []
+        for line in response.split('\n'):
+            if line.strip() == '':
+                continue
+            match = re.match(r'(\d+)\.\s*(.+)', line)
+            if match:
+                step_title = match.group(2).strip()
+                steps.append({"title": clean_math_symbols(step_title)})
+        
+        return steps[:5] if steps else fallback_plan
+    except Exception:
+        return fallback_plan
 
 def send_api_request(messages, max_tokens=200):
+    """Отправляет запрос к API с обработкой ошибок"""
     try:
-        response = requests.post(
-            API_URL,
-            headers={
-                "Authorization": f"Bearer {API_KEY}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://localhost",
-                "X-Title": "Math Tutor"
-            },
-            json={
-                "model": MODEL,
-                "messages": messages,
-                "temperature": 0.3,
-                "max_tokens": max_tokens
-            },
-            timeout=45
-        )
+        headers = {
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://localhost",
+            "X-Title": "Math Tutor"
+        }
         
-        if response.status_code == 200:
-            return response.json()["choices"][0]["message"]["content"]
-        else:
-            error = response.json().get("error", {}).get("message", "Неизвестная ошибка API")
-            return f"⚠️ Ошибка API: {error}"
-            
-    except Exception as e:
+        payload = {
+            "model": MODEL,
+            "messages": messages,
+            "temperature": 0.3,
+            "max_tokens": max_tokens
+        }
+        
+        response = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        
+        data = response.json()
+        return clean_math_symbols(data["choices"][0]["message"]["content"])
+    
+    except requests.exceptions.RequestException as e:
+        logger.error(f"API request failed: {str(e)}")
         return f"⚠️ Ошибка соединения: {str(e)}"
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        return f"⚠️ Ошибка обработки: {str(e)}"
 
 def generate_test_questions(topic, count=3):
-    messages = [{
-        "role": "system",
-        "content": f"Создай {count} тестовых вопроса по теме '{topic}' с вариантами ответов. Формат каждого вопроса:\nВОПРОС [номер]: [текст вопроса]\nA) [вариант A]\nB) [вариант B]\nC) [вариант C]\nD) [вариант D]\nОТВЕТ: [буква правильного варианта]\n\nИзбегай разметки, используй только буквы для вариантов."
-    }]
-    
-    prompt = f"Создай {count} разнообразных тестовых вопроса по теме '{topic}' с 4 вариантами ответов каждый."
-    messages.append({"role": "user", "content": prompt})
-    
-    response = send_api_request(messages, max_tokens=800)
-    return response
+    """Генерирует тестовые вопросы по теме"""
+    try:
+        messages = [{
+            "role": "system",
+            "content": f"Создай {count} тестовых вопроса по теме '{topic}' с вариантами ответов. "
+                       "Формат каждого вопроса:\n"
+                       "ВОПРОС [номер]: [текст вопроса]\n"
+                       "A) [вариант A]\nB) [вариант B]\nC) [вариант C]\nD) [вариант D]\n"
+                       "ОТВЕТ: [буква правильного варианта]\n\n"
+                       "Избегай разметки, используй только буквы для вариантов."
+        }]
+        
+        messages.append({
+            "role": "user", 
+            "content": f"Создай {count} разнообразных тестовых вопроса по теме '{topic}'"
+        })
+        
+        response = send_api_request(messages, max_tokens=800)
+        return parse_test_questions(response) if not response.startswith("⚠️") else []
+    except Exception:
+        return []
 
 def parse_test_questions(text):
+    """Парсит сгенерированные вопросы теста"""
     questions = []
     pattern = r'ВОПРОС\s*\d+:\s*(.+?)\s*A\)\s*(.+?)\s*B\)\s*(.+?)\s*C\)\s*(.+?)\s*D\)\s*(.+?)\s*ОТВЕТ:\s*([A-D])'
     matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
     
     for match in matches:
-        question = {
-            "text": match[0].strip(),
+        questions.append({
+            "text": clean_math_symbols(match[0].strip()),
             "options": {
-                "A": match[1].strip(),
-                "B": match[2].strip(),
-                "C": match[3].strip(),
-                "D": match[4].strip()
+                "A": clean_math_symbols(match[1].strip()),
+                "B": clean_math_symbols(match[2].strip()),
+                "C": clean_math_symbols(match[3].strip()),
+                "D": clean_math_symbols(match[4].strip())
             },
             "correct": match[5].upper().strip()
-        }
-        questions.append(question)
+        })
     
     return questions
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    username = update.effective_user.username
-    
-    db.add_user(user_id, username)
+    """Обработчик команды /start"""
+    user = update.effective_user
+    db.add_user(user.id, user.username)
     
     context.user_data['state'] = StudyState()
     context.user_data['messages'] = [{
         "role": "system",
-        "content": "Ты учитель. Объясняй темы кратко и понятно на русском языке максимум 200 слов. Используй простые примеры. Избегай разметки."
+        "content": "Ты учитель. Объясняй темы кратко и понятно на русском языке. "
+                   "Используй простые примеры. Избегай сложной разметки."
     }]
     
     keyboard = [
@@ -205,12 +248,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    welcome_text = "🎓 Добро пожаловать в учебного бота!\n\nВыберите действие:"
-    
-    await update.message.reply_text(welcome_text, reply_markup=reply_markup)
+    await update.message.reply_text(
+        "🎓 Добро пожаловать в учебного бота!\n\nВыберите действие:",
+        reply_markup=reply_markup
+    )
     return MAIN_MENU
 
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка главного меню"""
     query = update.callback_query
     await query.answer()
     state = context.user_data['state']
@@ -224,57 +269,65 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return await show_history(query, context)
     
     elif query.data == "about":
-        about_text = "🤖 Учебный бот v2.0\n\n📚 Создаю планы обучения\n🧪 Провожу тесты\n📊 Сохраняю историю\n\nВыберите 'Новое обучение' для начала!"
+        about_text = (
+            "🤖 Учебный бот v2.0\n\n"
+            "📚 Создаю планы обучения\n"
+            "🧪 Провожу тесты\n"
+            "📊 Сохраняю историю\n\n"
+            "Выберите 'Новое обучение' для начала!"
+        )
         
         keyboard = [[InlineKeyboardButton("← Главное меню", callback_data="main_menu")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(about_text, reply_markup=reply_markup)
+        await query.edit_message_text(about_text, reply_markup=InlineKeyboardMarkup(keyboard))
         return MAIN_MENU
     
     elif query.data == "main_menu":
         return await start_from_callback(query, context)
 
 async def start_from_callback(query, context):
+    """Возврат в главное меню"""
     keyboard = [
         [InlineKeyboardButton("📚 Новое обучение", callback_data="new_learning")],
         [InlineKeyboardButton("📖 Моя история", callback_data="my_history")],
         [InlineKeyboardButton("ℹ️ О боте", callback_data="about")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    welcome_text = "🎓 Главное меню\n\nВыберите действие:"
-    await query.edit_message_text(welcome_text, reply_markup=reply_markup)
+    await query.edit_message_text("🎓 Главное меню\n\nВыберите действие:", reply_markup=reply_markup)
     return MAIN_MENU
 
 async def show_history(query, context):
+    """Показывает историю обучения пользователя"""
     user_id = query.from_user.id
     history = db.get_user_history(user_id)
     
     if not history:
         await query.edit_message_text("📖 История обучения пуста\n\nНачните новое обучение!")
-        
         keyboard = [[InlineKeyboardButton("← Главное меню", callback_data="main_menu")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await context.bot.send_message(chat_id=user_id, text="Выберите действие:", reply_markup=reply_markup)
+        await context.bot.send_message(
+            chat_id=user_id, 
+            text="Выберите действие:", 
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return MAIN_MENU
     
     text = "📖 Ваша история обучения:\n\n"
     keyboard = []
     
-    for i, item in enumerate(history[-10:]):  # Показываем последние 10
+    for i, item in enumerate(history[-10:]):  # Последние 10 элементов
         date = datetime.fromisoformat(item["date"]).strftime("%d.%m")
         score_text = f" ({item['score']}%)" if item.get('score') else ""
         text += f"{i+1}. {item['topic']} - {date}{score_text}\n"
-        keyboard.append([InlineKeyboardButton(f"{i+1}. {item['topic'][:25]}...", callback_data=f"history_{i}")])
+        keyboard.append([InlineKeyboardButton(
+            f"{i+1}. {item['topic'][:25]}...", 
+            callback_data=f"history_{len(history)-10+i}"  # Фикс индексации
+        )])
     
     keyboard.append([InlineKeyboardButton("← Главное меню", callback_data="main_menu")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(text, reply_markup=reply_markup)
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     return HISTORY_VIEW
 
 async def handle_history_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка выбора из истории"""
     query = update.callback_query
     await query.answer()
     
@@ -286,8 +339,8 @@ async def handle_history_selection(update: Update, context: ContextTypes.DEFAULT
         user_id = query.from_user.id
         history = db.get_user_history(user_id)
         
-        if index < len(history):
-            item = history[-(10-index)]  # Берем из последних 10
+        if 0 <= index < len(history):
+            item = history[index]
             state = context.user_data['state']
             state.current_topic = item["topic"]
             state.study_plan = item["plan"]
@@ -295,47 +348,56 @@ async def handle_history_selection(update: Update, context: ContextTypes.DEFAULT
             
             await query.edit_message_text(f"📚 Возвращаемся к теме: {item['topic']}\n\nПлан обучения загружен!")
             
-            keyboard = [[InlineKeyboardButton("Начать обучение →", callback_data="start_learning")]]
-            keyboard.append([InlineKeyboardButton("← Назад к истории", callback_data="back_to_history")])
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await context.bot.send_message(chat_id=user_id, text="Выберите действие:", reply_markup=reply_markup)
+            keyboard = [
+                [InlineKeyboardButton("Начать обучение →", callback_data="start_learning")],
+                [InlineKeyboardButton("← Назад к истории", callback_data="back_to_history")]
+            ]
+            await context.bot.send_message(
+                chat_id=user_id, 
+                text="Выберите действие:", 
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
             return PLAN_CREATED
     
     return HISTORY_VIEW
 
 async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка ввода темы"""
     state = context.user_data['state']
     user_input = update.message.text.strip()
     user_id = update.effective_user.id
+    
+    if not user_input:
+        await update.message.reply_text("⚠️ Пожалуйста, введите тему для изучения")
+        return AWAITING_TOPIC
     
     state.current_topic = user_input
     db.add_search(user_id, user_input)
     
     await update.message.reply_text(f"🌀 Генерирую план по теме '{user_input}'...")
-    
     state.study_plan = generate_plan(user_input)
-    state.current_state = PLAN_CREATED
     
-    plan_text = f"📚 План: '{user_input}'\n\n"
-    plan_text += "\n".join([f"{i+1}. {item['title']}" for i, item in enumerate(state.study_plan)])
+    plan_text = f"📚 План: '{user_input}'\n\n" + "\n".join(
+        [f"{i+1}. {item['title']}" for i, item in enumerate(state.study_plan)]
+    )
     
     keyboard = []
-    row = []
-    for i, item in enumerate(state.study_plan):
-        row.append(InlineKeyboardButton(f"{i+1}", callback_data=f"step_{i}"))
-        if len(row) == 5 or i == len(state.study_plan) - 1:
-            keyboard.append(row)
-            row = []
+    for i in range(len(state.study_plan)):
+        if i % 3 == 0:
+            keyboard.append([])
+        keyboard[-1].append(InlineKeyboardButton(f"{i+1}", callback_data=f"step_{i}"))
     
     keyboard.append([InlineKeyboardButton("Начать обучение →", callback_data="start_learning")])
     keyboard.append([InlineKeyboardButton("← Главное меню", callback_data="main_menu")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(plan_text, reply_markup=reply_markup)
+    await update.message.reply_text(
+        plan_text, 
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
     return PLAN_CREATED
 
 async def handle_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка шагов учебного плана"""
     query = update.callback_query
     await query.answer()
     state = context.user_data['state']
@@ -359,13 +421,26 @@ async def handle_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     current_item = state.study_plan[state.current_step]
     await query.edit_message_text(f"🔍 Пункт {state.current_step+1}: {current_item['title']}")
     
-    prompt = f"Объясни кратко и понятно тему: '{current_item['title']}' по предмету '{state.current_topic}'. Максимум 200 слов, простые примеры."
-    
-    messages.append({"role": "user", "content": prompt})
-    content = send_api_request(messages, max_tokens=200)
-    messages.append({"role": "assistant", "content": content})
-    
-    await context.bot.send_message(chat_id=query.from_user.id, text=format_response(content))
+    try:
+        prompt = (
+            f"Объясни кратко и понятно тему: '{current_item['title']}' "
+            f"по предмету '{state.current_topic}'. Используй простые примеры."
+        )
+        
+        messages.append({"role": "user", "content": prompt})
+        content = send_api_request(messages, max_tokens=300)
+        messages.append({"role": "assistant", "content": content})
+        
+        await context.bot.send_message(
+            chat_id=query.from_user.id, 
+            text=format_response(content)
+        )
+    except Exception as e:
+        logger.error(f"Error in explanation: {str(e)}")
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text="⚠️ Не удалось получить объяснение. Попробуйте следующий шаг."
+        )
     
     keyboard = []
     if state.current_step < len(state.study_plan) - 1:
@@ -374,12 +449,15 @@ async def handle_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         keyboard.append([InlineKeyboardButton("Завершить", callback_data="finish_plan")])
     
     keyboard.append([InlineKeyboardButton("← Главное меню", callback_data="main_menu")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await context.bot.send_message(chat_id=query.from_user.id, text="📝 Навигация:", reply_markup=reply_markup)
+    await context.bot.send_message(
+        chat_id=query.from_user.id, 
+        text="📝 Навигация:", 
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
     return PLAN_CREATED
 
 async def handle_end_plan(update, context: ContextTypes.DEFAULT_TYPE):
+    """Завершение учебного плана"""
     if isinstance(update, Update):
         user_id = update.message.from_user.id
     else:
@@ -393,12 +471,15 @@ async def handle_end_plan(update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📚 Новая тема", callback_data="new_learning")],
         [InlineKeyboardButton("← Главное меню", callback_data="main_menu")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await context.bot.send_message(chat_id=user_id, text="🎉 План завершен! Пройдите тест?", reply_markup=reply_markup)
+    await context.bot.send_message(
+        chat_id=user_id, 
+        text="🎉 План завершен! Пройдите тест?", 
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
     return POST_STUDY_CHOICE
 
 async def handle_test_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка выбора после обучения"""
     query = update.callback_query
     await query.answer()
     state = context.user_data['state']
@@ -411,8 +492,7 @@ async def handle_test_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return AWAITING_TOPIC
     elif query.data == "take_test":
         await query.edit_message_text("🌀 Создаю тест...")
-        test_content = generate_test_questions(state.current_topic)
-        state.test_questions = parse_test_questions(test_content)
+        state.test_questions = generate_test_questions(state.current_topic)
         
         if state.test_questions:
             state.current_question_index = 0
@@ -421,10 +501,11 @@ async def handle_test_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await show_question(context, state, query.from_user.id)
             return TEST_IN_PROGRESS
         else:
-            await query.edit_message_text("⚠️ Ошибка создания теста")
+            await query.edit_message_text("⚠️ Не удалось создать тест")
             return await handle_end_plan(query, context)
 
 async def show_question(context, state, user_id):
+    """Показывает текущий вопрос теста"""
     if state.current_question_index >= len(state.test_questions):
         return await finish_test(context, state, user_id)
     
@@ -433,12 +514,19 @@ async def show_question(context, state, user_id):
     
     keyboard = []
     for option in ['A', 'B', 'C', 'D']:
-        keyboard.append([InlineKeyboardButton(f"{option}) {question['options'][option]}", callback_data=f"answer_{option}")])
+        keyboard.append([InlineKeyboardButton(
+            f"{option}) {question['options'][option]}", 
+            callback_data=f"answer_{option}"
+        )])
     
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await context.bot.send_message(chat_id=user_id, text=question_text, reply_markup=reply_markup)
+    await context.bot.send_message(
+        chat_id=user_id, 
+        text=question_text, 
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 async def handle_test_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка ответа на вопрос теста"""
     query = update.callback_query
     await query.answer()
     state = context.user_data['state']
@@ -468,15 +556,16 @@ async def handle_test_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return await finish_test(context, state, query.from_user.id)
 
 async def finish_test(context, state, user_id):
-    score_percent = int((state.test_score / len(state.test_questions)) * 100)
-    result_text = f"📊 Результат: {state.test_score}/{len(state.test_questions)} ({score_percent}%)"
+    """Завершение теста и показ результатов"""
+    score_percent = int((state.test_score / len(state.test_questions)) * 100) if state.test_questions else 0
     
+    result_text = f"📊 Результат: {state.test_score}/{len(state.test_questions)} ({score_percent}%)"
     if state.test_score == len(state.test_questions):
         result_text += "\n🎉 Отлично!"
-    elif state.test_score >= len(state.test_questions) / 2:
+    elif score_percent >= 50:
         result_text += "\n👍 Хорошо!"
     else:
-        result_text += "\n📖 Стоит повторить"
+        result_text += "\n📖 Стоит повторить материал"
     
     if not state.from_history:
         db.add_to_history(user_id, state.current_topic, state.study_plan, score_percent)
@@ -486,12 +575,15 @@ async def finish_test(context, state, user_id):
         [InlineKeyboardButton("📚 Новая тема", callback_data="new_learning")],
         [InlineKeyboardButton("← Главное меню", callback_data="main_menu")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await context.bot.send_message(chat_id=user_id, text=result_text, reply_markup=reply_markup)
+    await context.bot.send_message(
+        chat_id=user_id, 
+        text=result_text, 
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
     return POST_TEST_CHOICE
 
 async def handle_post_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка действий после теста"""
     query = update.callback_query
     await query.answer()
     state = context.user_data['state']
@@ -510,6 +602,7 @@ async def handle_post_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return TEST_IN_PROGRESS
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Панель администратора"""
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ Доступ запрещен")
         return
@@ -525,14 +618,12 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += "👥 Все пользователи:\n"
     for user_id, data in all_users.items():
         username = data.get('username', 'Без ника')
-        username_display = f"@{username}" if username != 'Без ника' else f"ID: {user_id}"
+        username_display = f"@{username}" if username and username != 'Без ника' else f"ID: {user_id}"
         tests_count = data.get('tests_taken', 0)
         searches_count = len(data.get('searches', []))
         join_date = datetime.fromisoformat(data['join_date']).strftime("%d.%m.%Y")
         
-        avg_score = 0
-        if tests_count > 0:
-            avg_score = data.get('total_score', 0) / tests_count
+        avg_score = data.get('total_score', 0) / tests_count if tests_count > 0 else 0
         
         text += f"• {username_display}\n"
         text += f"  📅 Регистрация: {join_date}\n"
@@ -548,7 +639,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     recent_searches = []
     for user_id, data in all_users.items():
         username = data.get('username', 'Без ника')
-        username_display = f"@{username}" if username != 'Без ника' else f"ID: {user_id}"
+        username_display = f"@{username}" if username and username != 'Без ника' else f"ID: {user_id}"
         for search in data.get('searches', [])[-3:]:
             recent_searches.append((username_display, search['topic'], search['date']))
     
@@ -564,50 +655,39 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("❌ Отменено")
+    """Отмена текущего действия"""
+    await update.message.reply_text("❌ Действие отменено")
     return ConversationHandler.END
 
 def main() -> None:
+    """Запуск бота"""
     application = Application.builder().token(TOKEN).build()
     
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
-            MAIN_MENU: [
-                CommandHandler('start', start),
-                CallbackQueryHandler(handle_main_menu)
-            ],
+            MAIN_MENU: [CallbackQueryHandler(handle_main_menu)],
             AWAITING_TOPIC: [
-                CommandHandler('start', start),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_topic),
                 CallbackQueryHandler(handle_main_menu)
             ],
-            PLAN_CREATED: [
-                CommandHandler('start', start),
-                CallbackQueryHandler(handle_plan)
-            ],
-            POST_STUDY_CHOICE: [
-                CommandHandler('start', start),
-                CallbackQueryHandler(handle_test_choice)
-            ],
-            TEST_IN_PROGRESS: [
-                CommandHandler('start', start),
-                CallbackQueryHandler(handle_test_answer)
-            ],
-            POST_TEST_CHOICE: [
-                CommandHandler('start', start),
-                CallbackQueryHandler(handle_post_test)
-            ],
-            HISTORY_VIEW: [
-                CommandHandler('start', start),
-                CallbackQueryHandler(handle_history_selection)
-            ],
+            PLAN_CREATED: [CallbackQueryHandler(handle_plan)],
+            POST_STUDY_CHOICE: [CallbackQueryHandler(handle_test_choice)],
+            TEST_IN_PROGRESS: [CallbackQueryHandler(handle_test_answer)],
+            POST_TEST_CHOICE: [CallbackQueryHandler(handle_post_test)],
+            HISTORY_VIEW: [CallbackQueryHandler(handle_history_selection)],
         },
-        fallbacks=[CommandHandler('cancel', cancel)]
+        fallbacks=[CommandHandler('cancel', cancel)],
+        allow_reentry=True
     )
     
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler('admin', admin_panel))
+    
+    # Обработка команды /start вне диалога
+    application.add_handler(CommandHandler('start', start))
+    
+    logger.info("Бот запущен")
     application.run_polling()
 
 if __name__ == "__main__":
